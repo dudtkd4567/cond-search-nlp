@@ -75,8 +75,10 @@ def tokenize_rules(s: str) -> List[str]:
     if not s:
         return []
     s = s.lower()
+    s = s.replace("p/e", "pe").replace("pbr", "pbr").replace("per", "per")
     toks = re.findall(r"[0-9]+|[a-zA-Z]+|[가-힣]+", s)
     return [t for t in toks if len(t) >= 2]
+
 
 
 def build_query_token_set(query: str) -> set:
@@ -571,6 +573,9 @@ class EmbeddingRetriever:
         # code -> [meta...]
         self.compiled_lookup_by_code: Dict[str, List[Dict]] = {}
 
+        self._q_cache: Dict[str, np.ndarray] = {}
+        self._q_cache_max = 256
+
 
     def build_or_load(self, idx=None):
         src_fp = build_sources_fingerprint(BASE_DIR)
@@ -668,8 +673,16 @@ class EmbeddingRetriever:
         if self.emb is None or len(self.items) != self.emb.shape[0]:
             raise RuntimeError("[EMB] embeddings not loaded")
 
-        q_emb = self.model.encode([query], normalize_embeddings=True)
-        q = np.asarray(q_emb[0], dtype=np.float32)
+        qkey = query.strip()
+        q = self._q_cache.get(qkey)
+        if q is None:
+            q_emb = self.model.encode([qkey], normalize_embeddings=True)
+            q = np.asarray(q_emb[0], dtype=np.float32)
+
+            # 간단 LRU(같은 효과): max 넘으면 비움
+            if len(self._q_cache) >= self._q_cache_max:
+                self._q_cache.clear()
+            self._q_cache[qkey] = q
 
         sims = self.emb @ q
 
@@ -1006,7 +1019,7 @@ def intersect_and_rank(
     return out
 
 
-def run_combo_search(retriever: EmbeddingRetriever, query: str, per_clause_topk: int = 15):
+def run_combo_search(retriever: EmbeddingRetriever, query: str, per_clause_topk: int = 20):
     groups = parse_combo_query(query)
 
     print("==== 조합 조건 파싱 결과 ====")
@@ -1021,10 +1034,18 @@ def run_combo_search(retriever: EmbeddingRetriever, query: str, per_clause_topk:
     for gi, and_clauses in enumerate(groups, start=1):
         print(f"\n[OR 그룹 {gi}]")
         clause_results = []
+
+        # AND 개수 많을수록 교집합이 어려워지니 후보를 조금 더 넓힘
+        dyn_topk = per_clause_topk
+        if len(and_clauses) >= 3:
+            dyn_topk = max(dyn_topk, 35)
+        elif len(and_clauses) == 2:
+            dyn_topk = max(dyn_topk, 25)
+
         for ci, clause in enumerate(and_clauses, start=1):
             print(f"\n  (AND-{ci}) clause: {clause}")
 
-            hits = retriever.search(clause, topk=per_clause_topk)
+            hits = retriever.search(clause, topk=dyn_topk)
             hits = apply_learning(learn, clause, hits)
             hits = apply_numeric_boost(clause, hits, retriever)
             hits = apply_rule_boost(clause, hits, retriever)
@@ -1137,7 +1158,10 @@ def run(query: str, page_size: int = 10):
 
     # 단일 검색 + 더보기 + 학습
     print("[SEARCH] start")
-    hits = retriever.search(query, topk=500)
+    hits = retriever.search(query, topk=200)
+    # 상위 점수가 너무 낮거나, 결과가 너무 적으면 topk 확장 (성능/정확도 밸런스)
+    if len(hits) < 50:
+        hits = retriever.search(query, topk=400)
     hits = apply_learning(load_learn(), query, hits)
     hits = apply_numeric_boost(query, hits, retriever)
     hits = apply_rule_boost(query, hits, retriever)

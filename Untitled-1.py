@@ -66,6 +66,25 @@ def save_json(path: str, obj: Dict):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
+def tokenize_rules(s: str) -> List[str]:
+    """
+    룰 매칭용 토큰화:
+    - 한글/영문/숫자만 뽑고
+    - 길이 2 이상만
+    """
+    if not s:
+        return []
+    s = s.lower()
+    toks = re.findall(r"[0-9]+|[a-zA-Z]+|[가-힣]+", s)
+    return [t for t in toks if len(t) >= 2]
+
+
+def build_query_token_set(query: str) -> set:
+    """
+    쿼리를 토큰 set으로 만들어 룰 매칭에 사용
+    """
+    return set(tokenize_rules(query))
+
 
 # =========================
 # 2) XML 읽기: 인코딩 이슈 회피 + 로그
@@ -843,6 +862,64 @@ def apply_numeric_boost(
     out.sort(key=lambda x: x[1], reverse=True)
     return out
 
+def apply_rule_boost(
+    query: str,
+    hits: List[Tuple[CondItem, float]],
+    retriever: "EmbeddingRetriever",
+) -> List[Tuple[CondItem, float]]:
+    """
+    임베딩 결과에 룰 기반 토큰 매칭 점수를 가산한다.
+    - display_name / controls / code(file_name 제외)에 따라 가중치 다르게
+    """
+    if not hits:
+        return hits
+
+    q_tokens = build_query_token_set(query)
+    if not q_tokens:
+        return hits
+
+    out: List[Tuple[CondItem, float]] = []
+
+    for it, s in hits:
+        meta = retriever.compiled_lookup.get((it.file_name, it.code))
+        if meta is None:
+            # fallback: code-only 첫번째 (있으면)
+            metas = retriever.compiled_lookup_by_code.get(it.code, [])
+            meta = metas[0] if metas else None
+
+        display_name = ""
+        controls: List[str] = []
+        if meta:
+            display_name = (meta.get("display_name") or meta.get("name") or "").strip()
+            controls = meta.get("controls") or []
+
+        score_add = 0.0
+
+        # 1) display_name 토큰 매칭 (강)
+        if display_name:
+            d_tokens = set(tokenize_rules(display_name))
+            m = len(q_tokens & d_tokens)
+            if m > 0:
+                score_add += 0.030 * m
+
+        # 2) controls 토큰 매칭 (중)
+        if controls:
+            # controls는 문구가 짧으니 전체를 합쳐서 한번에 매칭
+            c_text = " ".join([c for c in controls if c])
+            c_tokens = set(tokenize_rules(c_text))
+            m = len(q_tokens & c_tokens)
+            if m > 0:
+                score_add += 0.012 * m
+
+        # 3) code 직접 언급 시 (약)  ex) "B1_7"
+        if it.code and it.code.lower() in query.lower():
+            score_add += 0.020
+
+        out.append((it, s + score_add))
+
+    out.sort(key=lambda x: x[1], reverse=True)
+    return out
+
 
 # =========================
 # 9) AND/OR 파싱
@@ -950,6 +1027,7 @@ def run_combo_search(retriever: EmbeddingRetriever, query: str, per_clause_topk:
             hits = retriever.search(clause, topk=per_clause_topk)
             hits = apply_learning(learn, clause, hits)
             hits = apply_numeric_boost(clause, hits, retriever)
+            hits = apply_rule_boost(clause, hits, retriever)
 
             clause_results.append((clause, hits))
 
@@ -1062,6 +1140,7 @@ def run(query: str, page_size: int = 10):
     hits = retriever.search(query, topk=500)
     hits = apply_learning(load_learn(), query, hits)
     hits = apply_numeric_boost(query, hits, retriever)
+    hits = apply_rule_boost(query, hits, retriever)
     print(f"[SEARCH] done: {len(hits)} hits")
 
     if not hits:

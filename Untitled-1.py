@@ -875,6 +875,59 @@ def parse_combo_query(query: str) -> List[List[str]]:
             groups.append(and_parts)
     return groups
 
+def intersect_and_rank(
+    clause_hits: List[List[Tuple[CondItem, float]]]
+) -> List[Tuple[CondItem, float, int]]:
+    """
+    AND clause들의 후보 리스트를 받아서,
+    모든 clause에 공통으로 등장하는 (file_name, code)만 남긴 뒤
+    점수 합(score_sum) 기준으로 정렬한다.
+
+    clause_hits 예시:
+        [
+            [(CondItem, score), ...],  # AND-1 결과
+            [(CondItem, score), ...],  # AND-2 결과
+            ...
+        ]
+
+    return:
+        [(CondItem, score_sum, hit_count), ...]
+        여기서 hit_count == len(clause_hits) 인 것만 반환
+    """
+    if not clause_hits:
+        return []
+
+    clause_cnt = len(clause_hits)
+    acc: Dict[Tuple[str, str], Dict] = {}
+
+    for hits in clause_hits:
+        seen_in_clause = set()
+        for it, score in hits:
+            key = (it.file_name, it.code)
+
+            # 같은 clause 안에서 동일 key 중복 집계 방지
+            if key in seen_in_clause:
+                continue
+            seen_in_clause.add(key)
+
+            if key not in acc:
+                acc[key] = {
+                    "item": it,
+                    "score_sum": 0.0,
+                    "hit_count": 0,
+                }
+
+            acc[key]["score_sum"] += float(score)
+            acc[key]["hit_count"] += 1
+
+    out: List[Tuple[CondItem, float, int]] = []
+    for v in acc.values():
+        if v["hit_count"] == clause_cnt:
+            out.append((v["item"], v["score_sum"], v["hit_count"]))
+
+    out.sort(key=lambda x: x[1], reverse=True)
+    return out
+
 
 def run_combo_search(retriever: EmbeddingRetriever, query: str, per_clause_topk: int = 15):
     groups = parse_combo_query(query)
@@ -908,6 +961,31 @@ def run_combo_search(retriever: EmbeddingRetriever, query: str, per_clause_topk:
                 print(f"    [{rank}] {it.name} (score={score:.4f}) code={it.code} file={it.file_name}")
 
         group_results.append(clause_results)
+        
+    # -----------------------------
+    # AND 교집합 랭킹 출력
+    # -----------------------------
+    print("\n==== AND 교집합 랭킹 결과 (OR 그룹별) ====")
+
+    for gi, clause_results in enumerate(group_results, start=1):
+        print(f"\n[OR 그룹 {gi}]")
+
+        clause_hits = []
+        for _clause_text, hits in clause_results:
+            clause_hits.append(hits)
+
+        ranked = intersect_and_rank(clause_hits)
+
+        if not ranked:
+            print("  - AND 조건을 모두 만족하는 지표 없음")
+            continue
+
+        for rank, (it, score_sum, hit_count) in enumerate(ranked[:10], start=1):
+            print(
+                f"  [{rank}] {it.name} "
+                f"(score_sum={score_sum:.4f}, clauses={hit_count}) "
+                f"code={it.code} file={it.file_name}"
+            )
 
     return group_results
 

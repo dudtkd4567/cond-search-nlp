@@ -38,6 +38,28 @@ EMB_META_PATH = os.path.join(BASE_DIR, "emb_meta.json")
 LEARN_PATH = os.path.join(BASE_DIR, "learn.json")
 LEARN_ALPHA = 0.20
 
+def set_base_dir(base_dir: str):
+    """
+    서버에서 base_dir 주입 시, 경로 상수들을 함께 갱신한다.
+    (원래 코드는 import 시점의 BASE_DIR로 경로가 고정되므로 필요)
+    """
+    global BASE_DIR
+    global EMB_ITEMS_PATH, EMB_VECTORS_PATH
+    global COMPILED_ITEMS_PATH, COMPILED_TEXTS_PATH, COMPILED_MANIFEST_PATH
+    global EMB_META_PATH, LEARN_PATH
+
+    BASE_DIR = base_dir
+
+    EMB_ITEMS_PATH = os.path.join(BASE_DIR, "emb_items.pkl")
+    EMB_VECTORS_PATH = os.path.join(BASE_DIR, "emb_vectors.npy")
+
+    COMPILED_ITEMS_PATH = os.path.join(BASE_DIR, "compiled_items.pkl")
+    COMPILED_TEXTS_PATH = os.path.join(BASE_DIR, "compiled_texts.pkl")
+    COMPILED_MANIFEST_PATH = os.path.join(BASE_DIR, "compiled_manifest.json")
+
+    EMB_META_PATH = os.path.join(BASE_DIR, "emb_meta.json")
+
+    LEARN_PATH = os.path.join(BASE_DIR, "learn.json")
 
 # =========================
 # 1) 유틸
@@ -1019,7 +1041,10 @@ def intersect_and_rank(
     return out
 
 
-def run_combo_search(retriever: EmbeddingRetriever, query: str, per_clause_topk: int = 20):
+def run_combo_search(retriever, query, per_clause_topk=15, learn=None):
+    if learn is None:
+        learn = {"token_code": {}, "code_bias": {}}
+        
     groups = parse_combo_query(query)
 
     print("==== 조합 조건 파싱 결과 ====")
@@ -1029,7 +1054,8 @@ def run_combo_search(retriever: EmbeddingRetriever, query: str, per_clause_topk:
     print("\n==== clause별 지표 후보 ====")
 
     group_results = []
-    learn = load_learn()
+    if learn is None:
+        learn = {"token_code": {}, "code_bias": {}}
 
     for gi, and_clauses in enumerate(groups, start=1):
         print(f"\n[OR 그룹 {gi}]")
@@ -1112,6 +1138,124 @@ def print_page(hits: List[Tuple[CondItem, float]], page: int, page_size: int) ->
 
     return (start, end)
 
+class CondSearchEngine:
+    """
+    FastAPI 서버에서 startup 시 1회 로딩하고,
+    request마다 search만 수행하도록 하는 상주 엔진 래퍼.
+    """
+    def __init__(self, base_dir: str = BASE_DIR, model_name: str = EMB_MODEL_NAME):
+        set_base_dir(base_dir)
+        self.model_name = model_name
+        self.retriever = EmbeddingRetriever(model_name=model_name)
+        self._loaded = False
+
+        self._learn_cache = None
+        self._learn_mtime = -1
+
+    def _get_learn(self):
+        """
+        learn.json을 mtime 기반으로 캐시.
+        파일이 바뀌지 않으면 디스크/JSON 파싱을 반복하지 않는다.
+        """
+        try:
+            st = os.stat(LEARN_PATH)
+            mtime = int(st.st_mtime)
+        except FileNotFoundError:
+            self._learn_cache = {"token_code": {}, "code_bias": {}}
+            self._learn_mtime = -1
+            return self._learn_cache
+
+        if self._learn_cache is None or mtime != self._learn_mtime:
+            self._learn_cache = load_learn()
+            self._learn_mtime = mtime
+        return self._learn_cache
+    
+    def load(self):
+        if self._loaded:
+            return
+        t0 = time.time()
+        self.retriever.build_or_load(None)
+        t1 = time.time()
+        print(f"[ENGINE] loaded init+build_or_load={t1 - t0:.3f}s")
+        self._loaded = True
+
+    def search(self, query: str, topk: int = 200, per_clause_topk: int = 15) -> dict:
+        if not self._loaded:
+            raise RuntimeError("Engine not loaded. Call load() at startup first.")
+
+        query = (query or "").strip()
+        if not query:
+            return {"hits": []}
+
+        # 조합 검색(AND/OR)
+        if looks_like_combo(query):
+            groups = parse_combo_query(query)
+            learn = load_learn()
+
+            group_results = []
+            and_ranked_results = []
+
+            for and_clauses in groups:
+                clause_hits = []
+
+                dyn_topk = per_clause_topk
+                if len(and_clauses) >= 3:
+                    dyn_topk = max(dyn_topk, 35)
+                elif len(and_clauses) == 2:
+                    dyn_topk = max(dyn_topk, 25)
+
+                for clause in and_clauses:
+                    hits = self.retriever.search(clause, topk=dyn_topk)
+                    hits = apply_learning(learn, clause, hits)
+                    hits = apply_numeric_boost(clause, hits, self.retriever)
+                    hits = apply_rule_boost(clause, hits, self.retriever)
+                    clause_hits.append(hits)
+
+                ranked = intersect_and_rank(clause_hits)
+                and_ranked_results.append([
+                    {
+                        "name": it.name,
+                        "code": it.code,
+                        "file_name": it.file_name,
+                        "score_sum": float(score_sum),
+                        "hit_count": int(hit_count),
+                    }
+                    for (it, score_sum, hit_count) in ranked[:50]
+                ])
+
+                group_results.append(and_clauses)
+
+            return {
+                "mode": "combo",
+                "groups": group_results,
+                "and_ranked": and_ranked_results,
+            }
+
+        # 단일 검색
+        t0 = time.time()
+        hits = self.retriever.search(query, topk=topk)
+        t1 = time.time()
+        learn = self._get_learn()
+        hits = apply_learning(learn, query, hits)
+        t2 = time.time()
+        hits = apply_numeric_boost(query, hits, self.retriever)
+        t3 = time.time()
+        hits = apply_rule_boost(query, hits, self.retriever)
+        t4 = time.time()
+        print(f"[TIME] search={t1-t0:.3f}s learn={t2-t1:.3f}s numeric={t3-t2:.3f}s rule={t4-t3:.3f}s total={t4-t0:.3f}s")
+
+        return {
+            "mode": "single",
+            "hits": [
+                {
+                    "name": it.name,
+                    "code": it.code,
+                    "file_name": it.file_name,
+                    "score": float(score),
+                }
+                for (it, score) in hits[:topk]
+            ]
+        }
 
 # =========================
 # 11) 메인 run()
@@ -1129,8 +1273,13 @@ def run(query: str, page_size: int = 10):
 
     # 조합 검색
     if looks_like_combo(query):
-        group_results = run_combo_search(retriever, query, per_clause_topk=15)
-
+        learn = self._get_learn()
+        group_results = run_combo_search(
+            retriever,
+            query,
+            per_clause_topk=15,
+            learn=learn
+        )
         print("\n명령: [review] clause 학습 | [q] 종료")
         cmd = input(">> ").strip().lower()
         if cmd in ("review", "r"):
